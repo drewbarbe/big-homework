@@ -1,0 +1,258 @@
+import re
+import nltk
+import gensim
+import pyLDAvis
+import pyLDAvis.gensim_models
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+import seaborn as sns
+import numpy as np
+import requests
+from nltk.stem import WordNetLemmatizer
+from nltk.corpus import stopwords
+from typing import List, Dict, Any, Tuple
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# 下载必要的NLTK资源
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+nltk.download('wordnet', quiet=True)
+nltk.download('punkt_tab', quiet=True)
+
+# 设置中文字体，确保你的环境中有对应的字体文件，这里以 SimHei 为例
+plt.rcParams['font.sans-serif'] = ['SimHei']  
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示为方块的问题
+
+
+class NewsTopicAnalyzer:
+    """新闻主题分析器，包含数据预处理、LDA建模和可视化功能"""
+
+    def __init__(self, news_data: List[str], num_topics: int = 5):
+        """
+        初始化分析器
+
+        参数:
+            news_data: 新闻文本列表
+            num_topics: 要提取的主题数量
+        """
+        self.news_data = news_data
+        self.num_topics = num_topics
+        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = set(stopwords.words('english'))
+        self.dictionary = None
+        self.corpus = None
+        self.lda_model = None
+        self.topic_term_matrix = None
+        self.doc_topic_matrix = None
+
+    def preprocess_data(self) -> List[List[str]]:
+        """
+        数据预处理：分词、清洗、去停用词和词形还原
+
+        返回:
+            预处理后的词列表
+        """
+        preprocessed_docs = []
+
+        for doc in self.news_data:
+            # 1. 清洗文本：去除非字母字符，转为小写
+            doc_clean = re.sub(r'[^a-zA-Z\s]', '', doc.lower())
+
+            # 2. 分词（使用正确的分词器）
+            tokens = nltk.word_tokenize(doc_clean) 
+
+            # 3. 去停用词和短词
+            tokens = [token for token in tokens if token not in self.stop_words and len(token) > 2]
+
+            # 4. 词形还原
+            tokens = [self.lemmatizer.lemmatize(token) for token in tokens]
+
+            preprocessed_docs.append(tokens)
+
+        return preprocessed_docs
+
+    def build_lda_model(self, preprocessed_docs: List[List[str]]) -> None:
+        """
+        构建LDA模型
+
+        参数:
+            preprocessed_docs: 预处理后的词列表
+        """
+        # 1. 构建词典
+        self.dictionary = gensim.corpora.Dictionary(preprocessed_docs)
+
+        # 过滤极端词：出现次数少于2或多于50%文档的词
+        self.dictionary.filter_extremes(no_below=2, no_above=0.5)
+
+        # 2. 生成语料库
+        self.corpus = [self.dictionary.doc2bow(doc) for doc in preprocessed_docs]
+
+        # 3. 训练LDA模型
+        self.lda_model = gensim.models.LdaModel(
+            self.corpus,
+            num_topics=self.num_topics,
+            id2word=self.dictionary,
+            passes=10,
+            alpha='auto',
+            eta='auto',
+            random_state=42
+        )
+
+        # 提取主题-词矩阵和文档-主题矩阵
+        self.topic_term_matrix = self.lda_model.get_topics()
+        self.doc_topic_matrix = np.array([
+            [topic[1] for topic in self.lda_model[doc]]
+            for doc in self.corpus
+        ])
+
+    def visualize_lda(self) -> None:
+        """生成LDA可视化结果"""
+        # 1. 生成pyLDAvis交互图
+        vis_data = pyLDAvis.gensim_models.prepare(
+            self.lda_model, self.corpus, self.dictionary, sort_topics=False
+        )
+        pyLDAvis.save_html(vis_data, 'lda_visualization.html')
+        print("pyLDAvis交互图已保存至lda_visualization.html")
+
+        # 2. 生成主题词云图
+        self._generate_topic_wordclouds()
+
+        # 3. 生成文档-主题热力图
+        self._generate_doc_topic_heatmap()
+
+    def _generate_topic_wordclouds(self) -> None:
+        """生成各主题的词云图"""
+        plt.figure(figsize=(15, 10))
+
+        for i in range(self.num_topics):
+            # 获取主题关键词
+            topic_words = self.lda_model.show_topic(i, topn=15)
+            word_dict = {word: weight for word, weight in topic_words}
+
+            # 生成词云，确保中文显示（需保证 simhei.ttf 字体存在，也可替换成其他支持中文的字体路径）
+            wordcloud = WordCloud(
+                width=800, height=400, background_color='white',
+                max_words=15, font_path='simhei.ttf'  
+            ).generate_from_frequencies(word_dict)
+
+            plt.subplot(1, self.num_topics, i + 1)
+            plt.imshow(wordcloud, interpolation='bilinear')
+            plt.title(f'主题 {i + 1}')
+            plt.axis('off')
+
+        plt.tight_layout()
+        plt.savefig('topic_wordclouds.png', dpi=300)
+        print("主题词云图已保存至topic_wordclouds.png")
+
+    def _generate_doc_topic_heatmap(self) -> None:
+        """生成文档-主题概率分布热力图"""
+        # 对文档-主题矩阵进行归一化
+        norm_doc_topic = self.doc_topic_matrix / self.doc_topic_matrix.sum(axis=1, keepdims=True)
+
+        plt.figure(figsize=(12, 8))
+        sns.heatmap(norm_doc_topic, cmap='YlGnBu', annot=True, fmt='.2f')
+        plt.title('文档-主题概率分布')
+        plt.xlabel('主题')
+        plt.ylabel('文档')
+
+        plt.tight_layout()
+        plt.savefig('doc_topic_heatmap.png', dpi=300)
+        print("文档-主题热力图已保存至doc_topic_heatmap.png")
+
+    def analyze_topics_with_large_model(self, base_url: str = "http://localhost:11434") -> List[str]:
+        """
+        使用大模型分析各主题的语义内容
+
+        参数:
+            base_url: 大模型API地址
+
+        返回:
+            各主题的分析结果列表
+        """
+        topic_analyses = []
+
+        for i in range(self.num_topics):
+            # 获取主题关键词
+            topic_words = self.lda_model.show_topic(i, topn=10)
+            keywords = ", ".join([word for word, _ in topic_words])
+
+            # 设计分析prompt
+            prompt = f"""
+            你是一位专业的主题分析师，请分析以下关键词代表的主题内容：
+            关键词: {keywords}
+
+            请用简洁的中文描述该主题，指出其核心内容和可能的上下文场景。
+            """
+
+            # 调用大模型API
+            response = requests.post(
+                f"{base_url}/api/generate",
+                json={
+                    "model": "deepseek-r1:7b",
+                    "prompt": prompt,
+                    "stream": False
+                }
+            )
+
+            if response.status_code == 200:
+                analysis = response.json().get("response", "").strip()
+                topic_analyses.append(analysis)
+                print(f"主题 {i + 1} 分析完成")
+            else:
+                topic_analyses.append(f"分析失败: {response.status_code}")
+                print(f"主题 {i + 1} 分析失败")
+
+        return topic_analyses
+
+    def print_topic_summaries(self, topic_analyses: List[str]) -> None:
+        """打印主题摘要"""
+        print("\n=== 主题分析结果 ===")
+        for i, analysis in enumerate(topic_analyses):
+            print(f"主题 {i + 1}:")
+            print(analysis)
+            print("-" * 50)
+
+
+def main():
+    """主函数：执行完整的新闻主题分析流程"""
+    # 替换为新的10条新闻数据
+    sample_news = [
+        "Tech giant Apple unveiled its latest smartwatch series, featuring advanced health monitoring sensors that can detect early signs of heart diseases with  percent accuracy in initial tests.",
+        "Elon Musks SpaceX successfully launched a batch of next - generation communication satellites, aiming to provide high - speed internet access to remote areas worldwide by the end of next year.",
+        "A team of Chinese engineers developed an ultra - thin flexible battery, which is expected to revolutionize the design of wearable devices like smart glasses and fitness trackers.",
+        "European Central Bank announced a  percent interest rate hike, citing persistent inflationary pressures that have pushed consumer prices in the eurozone up by  percent over the past year.",
+        "Amazon reported a record - breaking Prime Day sales volume, with over  millions of products sold globally in just  hours, boosting its quarterly revenue projections.",
+        "The global coffee market faced a supply crisis as adverse weather conditions in Brazil, the worlds largest coffee producer, reduced this years harvest by an estimated  percent.",
+        "Thousands of citizens in Sydney participated in a “Zero - Waste City” campaign, sorting many tons of garbage in a month to promote sustainable living practices.",
+        "A massive wildfire in California burned through more  acres of forest land, forcing the evacuation of several small towns and raising concerns about climate change - induced fire risks.",
+        "Tokyo introduced a new urban planning project, including the construction of  “sky gardens” on top of commercial buildings to improve air quality and provide green spaces for residents.",
+        "British researchers discovered a new antibody therapy that can effectively neutralize the most common strains of the flu virus, potentially reducing severe flu cases by half during winter seasons."
+    ]
+
+    # 初始化分析器，可根据需要调整主题数量 num_topics
+    analyzer = NewsTopicAnalyzer(news_data=sample_news, num_topics=3)
+
+    # 1. 数据预处理
+    print("正在进行数据预处理...")
+    preprocessed_docs = analyzer.preprocess_data()
+
+    # 2. 构建LDA模型
+    print("正在训练LDA模型...")
+    analyzer.build_lda_model(preprocessed_docs)
+
+    # 3. 可视化分析
+    print("正在生成可视化结果...")
+    analyzer.visualize_lda()
+
+    # 4. 使用大模型分析主题，需确保大模型服务地址 base_url 可访问
+    print("正在使用大模型分析主题内容...")
+    topic_analyses = analyzer.analyze_topics_with_large_model()
+
+    # 5. 打印主题摘要
+    analyzer.print_topic_summaries(topic_analyses)
+
+
+if __name__ == "__main__":
+    main()
