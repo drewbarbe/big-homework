@@ -1,0 +1,191 @@
+import requests
+import json
+import os
+from typing import Dict, Any, Optional, Generator
+
+class OllamaDeepSeekClient:
+    """与本地部署的Ollama DeepSeek模型进行交互的客户端"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model_name: str = "deepseek-r1:7b"):
+        """
+        初始化Ollama API客户端
+        
+        参数:
+            base_url: Ollama API的基础URL
+            model_name: 要使用的DeepSeek模型名称
+        """
+        self.base_url = base_url
+        self.model_name = model_name
+        
+    def generate(self, prompt: str, 
+                 options: Optional[Dict[str, Any]] = None,
+                 stream: bool = False) -> Generator[str, None, None]:
+        """
+        向Ollama API发送生成请求
+        
+        参数:
+            prompt: 提示文本
+            options: 可选的生成参数
+            stream: 是否使用流式响应
+            
+        返回:
+            如果stream为True，返回生成文本的生成器
+            如果stream为False，返回完整的生成文本
+        """
+        # 构建请求参数
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": stream
+        }
+        
+        # 添加可选参数
+        if options:
+            payload.update(options)
+            
+        # 发送请求
+        response = requests.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            stream=stream
+        )
+        
+        # 检查响应状态
+        if response.status_code != 200:
+            raise Exception(f"API请求失败: {response.status_code} - {response.text}")
+        
+        # 处理流式响应
+        if stream:
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    if "response" in data:
+                        yield data["response"]
+        else:
+            # 处理非流式响应
+            data = response.json()
+            yield data.get("response", "")
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """获取模型信息"""
+        response = requests.post(
+            f"{self.base_url}/api/show",
+            json={"name": self.model_name}
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"获取模型信息失败: {response.status_code} - {response.text}")
+            
+        return response.json()
+
+def analyze_sentiment(prompt_text: str) -> str:
+    """
+    设计prompt让大模型进行文本情感分析
+    
+    参数:
+        prompt_text: 待分析的文本
+        
+    返回:
+        大模型的情感分析结果
+    """
+    # 设计一个结构化的prompt，引导模型进行情感分析
+    prompt = f"""
+    你是一个专业的社交媒体内容情感分析专家，擅长识别文本中的情感倾向。
+    请根据以下标准分析给定的社交媒体帖子的情感倾向：
+    1. 积极情感：文本表达了正面情绪、赞扬、满意等
+    2. 消极情感：文本表达了负面情绪、批评、不满等
+    3. 中性情感：文本不表达明显的积极或消极情绪
+    
+    请仅回答"积极"、"消极"或"中性"，不要包含其他内容。
+    
+    帖子内容:
+    "{prompt_text}"
+    """
+    
+    return prompt
+
+def read_posts_from_file(file_path: str) -> list:
+    """
+    从txt文件读取帖子数据
+    
+    参数:
+        file_path: 文件路径
+        
+    返回:
+        帖子列表，每个元素是一个字典，包含post_id和post_text
+    """
+    posts = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            # 读取标题行
+            headers = file.readline().strip().split('\t')
+            # 找到post_id和post_text的索引
+            post_id_idx = headers.index('post_id') if 'post_id' in headers else None
+            post_text_idx = headers.index('post_text') if 'post_text' in headers else None
+            
+            if post_id_idx is None or post_text_idx is None:
+                print("错误: 文件中缺少必要的列 (post_id 或 post_text)")
+                return posts
+                
+            # 读取每一行数据
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                parts = line.split('\t')
+                if len(parts) > max(post_id_idx, post_text_idx):
+                    posts.append({
+                        'post_id': parts[post_id_idx],
+                        'post_text': parts[post_text_idx]
+                    })
+                    
+    except Exception as e:
+        print(f"读取文件时出错: {e}")
+        
+    return posts
+
+def main():
+    """演示如何使用客户端与模型交互并进行文本情感分析"""
+    client = OllamaDeepSeekClient(model_name="deepseek-r1:7b")
+    
+    # 打印模型信息
+    try:
+        model_info = client.get_model_info()
+        print(f"模型信息: {model_info.get('name', '未知')}")
+        print(f"描述: {model_info.get('description', '无描述')}")
+    except Exception as e:
+        print(f"获取模型信息时出错: {e}")
+    
+    # 从文件读取帖子
+    file_path = input("请输入帖子数据文件路径: ")
+    posts = read_posts_from_file(file_path)
+    
+    if not posts:
+        print("没有找到帖子数据，程序退出。")
+        return
+        
+    print(f"已加载 {len(posts)} 个帖子")
+    
+    # 分析每个帖子并显示结果
+    for i, post in enumerate(posts):
+        print(f"\n正在分析帖子 {i+1}/{len(posts)} (ID: {post['post_id']}):")
+        print(f"帖子内容: {post['post_text']}")
+        
+        # 生成分析prompt
+        prompt = analyze_sentiment(post['post_text'])
+        
+        # 调用模型进行分析
+        try:
+            prediction = ""
+            print("模型预测情感: ", end="")
+            for chunk in client.generate(prompt, stream=True):
+                print(chunk, end="", flush=True)
+                prediction += chunk
+            print()
+        except Exception as e:
+            print(f"分析时出错: {e}")
+            prediction = "错误"
+
+if __name__ == "__main__":
+    main()    
