@@ -1,0 +1,282 @@
+import requests
+import json
+import os
+from typing import Dict, Any, Optional, Generator
+
+class OllamaDeepSeekClient:
+    """与本地部署的Ollama DeepSeek模型进行交互的客户端"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model_name: str = "deepseek-r1:7b"):
+        """
+        初始化Ollama API客户端
+        
+        参数:
+            base_url: Ollama API的基础URL
+            model_name: 要使用的DeepSeek模型名称
+        """
+        self.base_url = base_url
+        self.model_name = model_name
+        
+    def generate(self, prompt: str, 
+                 options: Optional[Dict[str, Any]] = None,
+                 stream: bool = False) -> Generator[str, None, None]:
+        """
+        向Ollama API发送生成请求
+        
+        参数:
+            prompt: 提示文本
+            options: 可选的生成参数
+            stream: 是否使用流式响应
+            
+        返回:
+            如果stream为True，返回生成文本的生成器
+            如果stream为False，返回完整的生成文本
+        """
+        # 构建请求参数
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": stream
+        }
+        
+        # 添加可选参数
+        if options:
+            payload.update(options)
+            
+        # 发送请求
+        response = requests.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            stream=stream
+        )
+        
+        # 检查响应状态
+        if response.status_code != 200:
+            raise Exception(f"API请求失败: {response.status_code} - {response.text}")
+        
+        # 处理流式响应
+        if stream:
+            for line in response.iter_lines():
+                if line:
+                    data = json.loads(line)
+                    if "response" in data:
+                        yield data["response"]
+        else:
+            # 处理非流式响应
+            data = response.json()
+            yield data.get("response", "")
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """获取模型信息"""
+        response = requests.post(
+            f"{self.base_url}/api/show",
+            json={"name": self.model_name}
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f"获取模型信息失败: {response.status_code} - {response.text}")
+            
+        return response.json()
+
+def analyze_post_text(post_text: str) -> str:
+    """
+    设计prompt让大模型判断帖子真假，同时考虑情感因素的影响
+    
+    参数:
+        post_text: 待分析的帖子文本
+        
+    返回:
+        大模型的判断结果
+    """
+    # 设计一个结构化的prompt，引导模型在判断真假时考虑情感因素
+    prompt = f"""
+    你是一个专业的社交媒体内容分析专家，擅长识别虚假信息。
+    请根据以下标准分析给定的社交媒体帖子是否为假新闻：
+    1. 是否存在明显的事实错误
+    2. 是否使用夸张或情绪化的语言（过度积极或消极的情感可能是虚假信息的信号）
+    3. 是否与已知的事实相矛盾
+    
+    特别注意：
+    - 极端积极或消极的情感表达可能表明存在夸大或误导
+    - 中性情感的内容不一定就是真实的，仍需检查事实依据
+    
+    请仅回答"真"或"假"，不要包含其他内容。
+    
+    帖子内容:
+    "{post_text}"
+    """
+    
+    return prompt
+
+def read_posts_from_file(file_path: str) -> list:
+    """
+    从txt文件读取帖子数据
+    
+    参数:
+        file_path: 文件路径
+        
+    返回:
+        帖子列表，每个元素是一个字典，包含post_id、post_text和label
+    """
+    posts = []
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            # 读取标题行
+            headers = file.readline().strip().split('\t')
+            # 找到post_id、post_text和label的索引
+            post_id_idx = headers.index('post_id') if 'post_id' in headers else None
+            post_text_idx = headers.index('post_text') if 'post_text' in headers else None
+            label_idx = headers.index('label') if 'label' in headers else None
+            
+            if post_id_idx is None or post_text_idx is None or label_idx is None:
+                print("错误: 文件中缺少必要的列 (post_id, post_text 或 label)")
+                return posts
+                
+            # 读取每一行数据
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                parts = line.split('\t')
+                if len(parts) > max(post_id_idx, post_text_idx, label_idx):
+                    posts.append({
+                        'post_id': parts[post_id_idx],
+                        'post_text': parts[post_text_idx],
+                        'label': parts[label_idx]
+                    })
+                    
+    except Exception as e:
+        print(f"读取文件时出错: {e}")
+        
+    return posts
+
+def evaluate_accuracy(results: list) -> Dict[str, float]:
+    """
+    计算模型判断的准确度，包括总体准确度、假新闻准确度和真新闻准确度
+    
+    参数:
+        results: 包含判断结果的列表，每个元素是一个字典，包含label(实际标签)和prediction(预测标签)
+        
+    返回:
+        包含三种准确度指标的字典
+    """
+    if not results:
+        return {"accuracy": 0.0, "accuracy_fake": 0.0, "accuracy_true": 0.0}
+        
+    # 初始化计数器
+    total_correct = 0
+    total_fake = 0
+    total_true = 0
+    correct_fake = 0
+    correct_true = 0
+    
+    for result in results:
+        # 确定实际标签
+        actual = "假" if result['label'].lower() in ['fake', 'false', '0', '假'] else "真"
+        
+        # 标准化预测结果
+        prediction = result['prediction'].strip()
+        if prediction.lower() in ['假', 'false', 'f', 'fake', '0']:
+            predicted = "假"
+        elif prediction.lower() in ['真', 'true', 't', 'real', '1']:
+            predicted = "真"
+        else:
+            print(f"警告: 无法解析预测结果 '{prediction}'，视为预测错误")
+            predicted = "假"  # 将无法解析的预测视为预测错误(假)
+            
+        # 更新计数器
+        if actual == "假":
+            total_fake += 1
+            if predicted == "假":
+                correct_fake += 1
+                total_correct += 1
+        else:
+            total_true += 1
+            if predicted == "真":
+                correct_true += 1
+                total_correct += 1
+    
+    # 计算准确度
+    accuracy = total_correct / len(results) if results else 0.0
+    accuracy_fake = correct_fake / total_fake if total_fake > 0 else 0.0
+    accuracy_true = correct_true / total_true if total_true > 0 else 0.0
+    
+    return {
+        "accuracy": accuracy,
+        "accuracy_fake": accuracy_fake,
+        "accuracy_true": accuracy_true
+    }
+
+def main():
+    """演示如何使用客户端与模型交互并判断帖子真假"""
+    client = OllamaDeepSeekClient(model_name="deepseek-r1:7b")
+    
+    # 打印模型信息
+    try:
+        model_info = client.get_model_info()
+        print(f"模型信息: {model_info.get('name', '未知')}")
+        print(f"描述: {model_info.get('description', '无描述')}")
+    except Exception as e:
+        print(f"获取模型信息时出错: {e}")
+    
+    # 从文件读取帖子
+    file_path = input("请输入帖子数据文件路径: ")
+    posts = read_posts_from_file(file_path)
+    
+    if not posts:
+        print("没有找到帖子数据，程序退出。")
+        return
+        
+    print(f"已加载 {len(posts)} 个帖子")
+    
+    # 分析每个帖子并收集结果
+    results = []
+    for i, post in enumerate(posts):
+        print(f"\n正在分析帖子 {i+1}/{len(posts)} (ID: {post['post_id']}):")
+        print(f"帖子内容: {post['post_text']}")
+        print(f"实际标签: {'假' if post['label'].lower() == 'fake' else '真'}")
+        
+        # 生成分析prompt
+        prompt = analyze_post_text(post['post_text'])
+        
+        # 调用模型进行分析
+        try:
+            prediction = ""
+            print("模型预测结果: ", end="")
+            for chunk in client.generate(prompt, stream=True):
+                print(chunk, end="", flush=True)
+                prediction += chunk
+            print()
+            
+            # 存储结果用于后续评估
+            results.append({
+                'post_id': post['post_id'],
+                'label': post['label'],
+                'prediction': prediction
+            })
+        except Exception as e:
+            print(f"分析时出错: {e}")
+            results.append({
+                'post_id': post['post_id'],
+                'label': post['label'],
+                'prediction': "错误"
+            })
+    
+    # 计算准确度
+    if results:
+        metrics = evaluate_accuracy(results)
+        print("\n模型评估指标:")
+        print(f"总体准确度: {metrics['accuracy']:.2%}")
+        print(f"假新闻分类准确度: {metrics['accuracy_fake']:.2%}")
+        print(f"真新闻分类准确度: {metrics['accuracy_true']:.2%}")
+        
+        # 打印分类统计
+        total_fake = sum(1 for r in results if r['label'].lower() in ['fake', 'false', '0', '假'])
+        total_true = len(results) - total_fake
+        print(f"\n分类统计:")
+        print(f"总假新闻数: {total_fake}")
+        print(f"总真新闻数: {total_true}")
+
+if __name__ == "__main__":
+    main()    
