@@ -1,0 +1,269 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import BertModel, BertTokenizer
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, classification_report
+
+class MultimodalDataset(Dataset):
+    """多模态数据集，包含文本、主题特征和情感特征"""
+    def __init__(self, texts, topic_features, sentiment_features, labels, tokenizer, max_length=128):
+        self.texts = texts
+        self.topic_features = topic_features
+        self.sentiment_features = sentiment_features
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        topic_feature = self.topic_features[idx]
+        sentiment_feature = self.sentiment_features[idx]
+        label = self.labels[idx]
+        
+        # 对文本进行tokenize
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'topic_feature': torch.tensor(topic_feature, dtype=torch.float),
+            'sentiment_feature': torch.tensor(sentiment_feature, dtype=torch.float),
+            'label': torch.tensor(label, dtype=torch.long)
+        }
+
+class CrossModalAttention(nn.Module):
+    """跨模态注意力模块，用于动态对齐主题与情感特征"""
+    def __init__(self, hidden_size):
+        super(CrossModalAttention, self).__init__()
+        self.attn_weights = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+    def forward(self, topic_feature, sentiment_feature):
+        # 拼接主题和情感特征
+        concat_features = torch.cat([topic_feature, sentiment_feature], dim=-1)
+        
+        # 计算注意力权重
+        attn_weights = self.attn_weights(concat_features)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        
+        # 加权融合特征
+        fused_feature = attn_weights * topic_feature + (1 - attn_weights) * sentiment_feature
+        
+        return fused_feature
+
+class MultimodalSentimentAnalysisModel(nn.Module):
+    """多模态情感分析模型，使用BERT和跨模态注意力机制"""
+    def __init__(self, bert_model_name='bert-base-uncased', topic_dim=10, sentiment_dim=5, hidden_size=768):
+        super(MultimodalSentimentAnalysisModel, self).__init__()
+        
+        # BERT模型用于文本特征提取
+        self.bert = BertModel.from_pretrained(bert_model_name)
+        
+        # 主题特征投影层
+        self.topic_projection = nn.Linear(topic_dim, hidden_size)
+        
+        # 情感特征投影层
+        self.sentiment_projection = nn.Linear(sentiment_dim, hidden_size)
+        
+        # 跨模态注意力模块
+        self.cross_attention = CrossModalAttention(hidden_size)
+        
+        # 分类层
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),  # 3个特征: BERT特征、主题特征、情感特征
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 2)  # 二分类
+        )
+        
+    def forward(self, input_ids, attention_mask, topic_feature, sentiment_feature):
+        # 从BERT获取文本特征
+        bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        text_feature = bert_output.pooler_output  # [batch_size, hidden_size]
+        
+        # 投影主题特征
+        projected_topic = self.topic_projection(topic_feature)  # [batch_size, hidden_size]
+        
+        # 投影情感特征
+        projected_sentiment = self.sentiment_projection(sentiment_feature)  # [batch_size, hidden_size]
+        
+        # 使用跨模态注意力机制融合主题和情感特征
+        fused_feature = self.cross_attention(projected_topic, projected_sentiment)
+        
+        # 拼接所有特征
+        combined_feature = torch.cat([text_feature, fused_feature, projected_topic * projected_sentiment], dim=1)
+        
+        # 通过分类层获取输出
+        logits = self.classifier(combined_feature)
+        
+        return logits
+
+def train_model(model, train_dataloader, val_dataloader, optimizer, criterion, device, epochs=10):
+    """训练多模态情感分析模型"""
+    best_val_acc = 0.0
+    
+    for epoch in range(epochs):
+        # 训练模式
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for batch in train_dataloader:
+            # 将数据移至设备
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            topic_feature = batch['topic_feature'].to(device)
+            sentiment_feature = batch['sentiment_feature'].to(device)
+            labels = batch['label'].to(device)
+            
+            # 前向传播
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask, topic_feature, sentiment_feature)
+            loss = criterion(outputs, labels)
+            
+            # 反向传播和优化
+            loss.backward()
+            optimizer.step()
+            
+            # 计算训练准确率
+            _, predicted = outputs.max(1)
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
+            train_loss += loss.item()
+        
+        # 计算训练集指标
+        train_acc = 100.0 * train_correct / train_total
+        train_loss /= len(train_dataloader)
+        
+        # 验证模式
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        all_labels = []
+        all_preds = []
+        
+        with torch.no_grad():
+            for batch in val_dataloader:
+                # 将数据移至设备
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                topic_feature = batch['topic_feature'].to(device)
+                sentiment_feature = batch['sentiment_feature'].to(device)
+                labels = batch['label'].to(device)
+                
+                # 前向传播
+                outputs = model(input_ids, attention_mask, topic_feature, sentiment_feature)
+                loss = criterion(outputs, labels)
+                
+                # 计算验证准确率
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+                val_loss += loss.item()
+                
+                # 收集所有标签和预测结果用于详细评估
+                all_labels.extend(labels.cpu().numpy())
+                all_preds.extend(predicted.cpu().numpy())
+        
+        # 计算验证集指标
+        val_acc = 100.0 * val_correct / val_total
+        val_loss /= len(val_dataloader)
+        
+        # 打印训练进度
+        print(f'Epoch {epoch+1}/{epochs}')
+        print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%')
+        print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%')
+        print('-' * 50)
+        
+        # 保存最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f'Model saved with accuracy: {best_val_acc:.2f}%')
+    
+    # 打印详细分类报告
+    print("Final Validation Classification Report:")
+    print(classification_report(all_labels, all_preds))
+    
+    return model
+
+# 示例使用
+def main():
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 初始化tokenizer和模型
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = MultimodalSentimentAnalysisModel(
+        bert_model_name='bert-base-uncased',
+        topic_dim=10,  # 示例主题特征维度
+        sentiment_dim=5  # 示例情感特征维度
+    ).to(device)
+    
+    # 生成示例数据
+    texts = [
+        "This product is amazing! I love it.",
+        "Terrible experience, don't buy this.",
+        "It's okay, not the best but not bad.",
+        "Absolutely fantastic, highly recommended!"
+    ]
+    
+    # 示例主题特征 (实际应用中可通过主题模型如LDA、BERTopic等获取)
+    topic_features = [
+        np.random.rand(10) for _ in range(len(texts))
+    ]
+    
+    # 示例情感特征 (实际应用中可通过情感分析模型获取)
+    sentiment_features = [
+        np.random.rand(5) for _ in range(len(texts))
+    ]
+    
+    # 示例标签 (0=负面, 1=正面)
+    labels = [1, 0, 0, 1]
+    
+    # 创建数据集和数据加载器
+    dataset = MultimodalDataset(texts, topic_features, sentiment_features, labels, tokenizer)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    
+    # 定义优化器和损失函数
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
+    criterion = nn.CrossEntropyLoss()
+    
+    # 训练模型 (实际应用中应使用真实数据集并分割训练集和验证集)
+    model = train_model(model, dataloader, dataloader, optimizer, criterion, device, epochs=2)
+    
+    # 预测示例
+    model.eval()
+    with torch.no_grad():
+        sample = dataset[0]
+        input_ids = sample['input_ids'].unsqueeze(0).to(device)
+        attention_mask = sample['attention_mask'].unsqueeze(0).to(device)
+        topic_feature = sample['topic_feature'].unsqueeze(0).to(device)
+        sentiment_feature = sample['sentiment_feature'].unsqueeze(0).to(device)
+        
+        outputs = model(input_ids, attention_mask, topic_feature, sentiment_feature)
+        probs = F.softmax(outputs, dim=1)
+        prediction = torch.argmax(probs, dim=1).item()
+        
+        print(f"Sample Text: {texts[0]}")
+        print(f"Predicted Class: {prediction} (Positive: {probs[0][1]:.4f}, Negative: {probs[0][0]:.4f})")
+
+if __name__ == "__main__":
+    main()    
